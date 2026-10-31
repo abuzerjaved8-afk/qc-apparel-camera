@@ -99,7 +99,7 @@ DEFAULTS = {
 def load_config():
     config = dict(DEFAULTS)
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if "=" in line and not line.startswith("#"):
