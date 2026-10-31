@@ -108,12 +108,38 @@ def load_config():
     return config
 
 
+def save_config_value(key, value):
+    # Rewrites qc_camera_config.txt with one key updated (or appended if
+    # new), preserving every other line as-is. Always written as plain
+    # UTF-8 with no BOM — PowerShell's Out-File -Encoding utf8 adds one,
+    # which previously corrupted whichever key landed on the first line.
+    lines = []
+    found = False
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
+            for line in f:
+                stripped = line.strip()
+                if "=" in stripped and not stripped.startswith("#"):
+                    existing_key, _, _ = stripped.partition("=")
+                    if existing_key.strip() == key:
+                        lines.append(f"{key}={value}\n")
+                        found = True
+                        continue
+                lines.append(line if line.endswith("\n") else line + "\n")
+    if not found:
+        lines.append(f"{key}={value}\n")
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
 _config = load_config()
 CAMERA_SOURCE = _config["CAMERA_SOURCE"]
 if CAMERA_SOURCE.isdigit():
     CAMERA_SOURCE = int(CAMERA_SOURCE)
 STREAM_USER = _config["STREAM_USER"]
 STREAM_PASS = _config["STREAM_PASS"]
+_focus_config = _config.get("CAMERA_FOCUS", "").strip()
+CAMERA_FOCUS = int(_focus_config) if _focus_config.lstrip("-").isdigit() else None
 CAPTURE_WIDTH = 1920
 CAPTURE_HEIGHT = 1080
 JPEG_QUALITY = 85
@@ -130,8 +156,10 @@ stream_delay = 1 / STREAM_FPS
 
 
 def lock_camera_settings(cap):
+    # Focus is deliberately left out here — it's set explicitly by
+    # focus_setup() instead of whatever value autofocus happened to
+    # converge on during warmup.
     for auto_prop, auto_off_value, value_prop in [
-        (cv2.CAP_PROP_AUTOFOCUS, 0, cv2.CAP_PROP_FOCUS),
         (cv2.CAP_PROP_AUTO_EXPOSURE, 0, cv2.CAP_PROP_EXPOSURE),
         (cv2.CAP_PROP_AUTO_WB, 0, cv2.CAP_PROP_WB_TEMPERATURE),
     ]:
@@ -140,13 +168,12 @@ def lock_camera_settings(cap):
         cap.set(value_prop, current_value)
 
 
-def usb_capture_loop():
-    global latest_frame, latest_raw_frame, stream_delay
+def open_usb_camera():
     backend = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_V4L2
     cap = cv2.VideoCapture(CAMERA_SOURCE, backend)
     if not cap.isOpened():
         print(f"Could not open camera index {CAMERA_SOURCE}.")
-        return
+        return None
 
     # Without forcing MJPG first, many UVC cameras silently ignore the
     # requested resolution and fall back to a low default (e.g. 800x600).
@@ -159,6 +186,55 @@ def usb_capture_loop():
     for _ in range(60):
         cap.read()
     lock_camera_settings(cap)
+    return cap
+
+
+def focus_setup(cap):
+    """One-time manual focus calibration shown before streaming starts.
+    Displays the exact same full-resolution frames the live feed uses —
+    no downscaling or re-encoding — so what's judged here is the real
+    captured quality. +/- adjusts focus live, ENTER confirms and saves
+    it to the config file so future starts reuse it without asking again."""
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    focus_val = float(CAMERA_FOCUS) if CAMERA_FOCUS is not None else cap.get(cv2.CAP_PROP_FOCUS)
+    cap.set(cv2.CAP_PROP_FOCUS, focus_val)
+
+    window = "Focus Setup"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    step = 5
+
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        display = frame.copy()
+        cv2.putText(display, f"Focus: {focus_val:.0f}", (40, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3)
+        cv2.putText(display, "+/- adjust    ENTER confirm and start streaming",
+                    (40, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv2.imshow(window, display)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (13, 10):
+            break
+        elif key in (ord("+"), ord("=")):
+            focus_val = min(255, focus_val + step)
+            cap.set(cv2.CAP_PROP_FOCUS, focus_val)
+        elif key in (ord("-"), ord("_")):
+            focus_val = max(0, focus_val - step)
+            cap.set(cv2.CAP_PROP_FOCUS, focus_val)
+        elif key == ord("q"):
+            stop_event.set()
+            break
+
+    cv2.destroyWindow(window)
+    if not stop_event.is_set():
+        save_config_value("CAMERA_FOCUS", int(focus_val))
+        print(f"Focus set to {focus_val:.0f} and saved to {CONFIG_FILE}")
+
+
+def usb_capture_loop(cap):
+    global latest_frame, latest_raw_frame, stream_delay
 
     # Match the network stream's pace to what the camera actually delivers.
     # The driver-reported FPS (CAP_PROP_FPS) is unreliable on many UVC
@@ -433,7 +509,15 @@ def main():
               f"no decode/encode, no other processing.")
         server = ThreadingHTTPServer(("0.0.0.0", PORT), RelayHandler)
     else:
-        threading.Thread(target=usb_capture_loop, daemon=True).start()
+        cap = open_usb_camera()
+        if cap is None:
+            return
+        focus_setup(cap)
+        if stop_event.is_set():
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+        threading.Thread(target=usb_capture_loop, args=(cap,), daemon=True).start()
         server = ThreadingHTTPServer(("0.0.0.0", PORT), UsbStreamHandler)
 
     print(f"Serving at http://0.0.0.0:{PORT}/video  (snapshot: /shot.jpg)")
