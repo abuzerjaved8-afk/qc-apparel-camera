@@ -303,29 +303,58 @@ def usb_capture_loop(cap):
     else:
         print(f"Could not measure camera rate, falling back to {STREAM_FPS} FPS.")
 
+    # When the camera actually drops (USB power event, driver reset, loose
+    # cable), cap.read() on DSHOW frequently doesn't fail fast — it just
+    # blocks forever, so a simple failure counter never gets the chance to
+    # run. A watchdog thread tracks how long the current read has been
+    # running and, if it's stuck past WATCHDOG_TIMEOUT, calls cap.release()
+    # from outside — that's the standard way to force a blocked
+    # VideoCapture.read() to return, since there's no native read timeout.
+    state = {"cap": cap, "read_started_at": None}
+    WATCHDOG_TIMEOUT = 5.0
+
+    def watchdog():
+        while not stop_event.is_set():
+            time.sleep(1)
+            started = state["read_started_at"]
+            if started is not None and time.monotonic() - started > WATCHDOG_TIMEOUT:
+                print("Camera read appears stuck, forcing release to unblock it...")
+                try:
+                    state["cap"].release()
+                except Exception:
+                    pass
+                state["read_started_at"] = None
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
     consecutive_failures = 0
     # A few transient failures aren't worth reopening over, but if the
-    # camera has actually dropped (USB power management, driver reset,
-    # loose cable) retrying forever on the same dead handle never
-    # recovers — the feed just goes black until someone restarts the
-    # whole program. Past this many failures in a row (~5s), do a full
-    # release + reopen instead, carrying over the saved focus/exposure.
+    # camera has actually dropped, retrying forever on the same dead
+    # handle never recovers — the feed just goes black until someone
+    # restarts the whole program. Past this many failures in a row,
+    # do a full reopen instead, carrying over the saved focus/exposure.
     REOPEN_AFTER = 10
 
     while not stop_event.is_set():
-        ret, frame = cap.read()
+        state["read_started_at"] = time.monotonic()
+        ret, frame = state["cap"].read()
+        state["read_started_at"] = None
         if not ret:
             consecutive_failures += 1
             print(f"Frame grab failed ({consecutive_failures}), retrying...")
             if consecutive_failures >= REOPEN_AFTER:
                 print("Camera appears to have dropped, reopening device...")
-                cap.release()
-                cap = None
-                while cap is None and not stop_event.is_set():
-                    cap = reopen_usb_camera()
-                    if cap is None:
+                try:
+                    state["cap"].release()
+                except Exception:
+                    pass
+                new_cap = None
+                while new_cap is None and not stop_event.is_set():
+                    new_cap = reopen_usb_camera()
+                    if new_cap is None:
                         time.sleep(2)
-                if cap is not None:
+                if new_cap is not None:
+                    state["cap"] = new_cap
                     print("Camera reopened successfully.")
                     consecutive_failures = 0
             else:
@@ -337,7 +366,7 @@ def usb_capture_loop(cap):
             with frame_lock:
                 latest_frame = jpeg.tobytes()
                 latest_raw_frame = frame
-    cap.release()
+    state["cap"].release()
 
 
 def check_auth(handler):
@@ -388,7 +417,7 @@ class UsbStreamHandler(BaseHTTPRequestHandler):
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
                     time.sleep(stream_delay)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
             return
 
@@ -415,7 +444,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             try:
                 for chunk in upstream.iter_content(chunk_size=4096):
                     self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
             finally:
                 upstream.close()
