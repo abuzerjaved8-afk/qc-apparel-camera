@@ -156,18 +156,28 @@ def usb_capture_loop():
     print(f"Camera opened at {cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x"
           f"{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}")
 
-    # Match the network stream's pace to what the camera actually delivers,
-    # instead of a hardcoded cap that falls behind the local preview.
-    reported_fps = cap.get(cv2.CAP_PROP_FPS)
-    if reported_fps and reported_fps > 1:
-        stream_delay = 1 / reported_fps
-        print(f"Camera reports {reported_fps:.0f} FPS, streaming at that rate.")
-    else:
-        print(f"Camera did not report a usable FPS, falling back to {STREAM_FPS}.")
-
     for _ in range(60):
         cap.read()
     lock_camera_settings(cap)
+
+    # Match the network stream's pace to what the camera actually delivers.
+    # The driver-reported FPS (CAP_PROP_FPS) is unreliable on many UVC
+    # cameras/backends (DSHOW in particular often reports 0), so measure
+    # the real achieved rate directly instead of trusting it.
+    warmup_frames = 20
+    start = time.perf_counter()
+    measured = 0
+    for _ in range(warmup_frames):
+        ok, _ = cap.read()
+        if ok:
+            measured += 1
+    elapsed = time.perf_counter() - start
+    if measured > 0 and elapsed > 0:
+        measured_fps = measured / elapsed
+        stream_delay = 1 / measured_fps
+        print(f"Measured camera rate: {measured_fps:.1f} FPS, streaming at that rate.")
+    else:
+        print(f"Could not measure camera rate, falling back to {STREAM_FPS} FPS.")
 
     while not stop_event.is_set():
         ret, frame = cap.read()
