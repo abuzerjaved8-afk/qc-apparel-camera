@@ -124,6 +124,9 @@ frame_lock = threading.Lock()
 latest_frame = None
 latest_raw_frame = None
 stop_event = threading.Event()
+# Updated once the camera is open, from its own reported FPS, so the
+# network stream isn't throttled below what the camera can deliver.
+stream_delay = 1 / STREAM_FPS
 
 
 def lock_camera_settings(cap):
@@ -138,7 +141,7 @@ def lock_camera_settings(cap):
 
 
 def usb_capture_loop():
-    global latest_frame, latest_raw_frame
+    global latest_frame, latest_raw_frame, stream_delay
     backend = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_V4L2
     cap = cv2.VideoCapture(CAMERA_SOURCE, backend)
     if not cap.isOpened():
@@ -152,6 +155,15 @@ def usb_capture_loop():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
     print(f"Camera opened at {cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x"
           f"{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f}")
+
+    # Match the network stream's pace to what the camera actually delivers,
+    # instead of a hardcoded cap that falls behind the local preview.
+    reported_fps = cap.get(cv2.CAP_PROP_FPS)
+    if reported_fps and reported_fps > 1:
+        stream_delay = 1 / reported_fps
+        print(f"Camera reports {reported_fps:.0f} FPS, streaming at that rate.")
+    else:
+        print(f"Camera did not report a usable FPS, falling back to {STREAM_FPS}.")
 
     for _ in range(60):
         cap.read()
@@ -218,7 +230,7 @@ class UsbStreamHandler(BaseHTTPRequestHandler):
                     self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
-                    time.sleep(1 / STREAM_FPS)
+                    time.sleep(stream_delay)
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
