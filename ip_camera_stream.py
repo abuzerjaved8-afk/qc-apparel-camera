@@ -298,6 +298,20 @@ def camera_worker_process(frame_queue, stop_evt):
     cap = reopen_usb_camera()
     if cap is None:
         return
+
+    # Some camera power/driver states (seen in practice: the activity LED
+    # goes off, matching a sensor that's stopped actually streaming) keep
+    # returning ret=True from read() with a stale or blank buffer forever
+    # — no failure, no hang, so neither of the other recovery paths ever
+    # fires. Real video, even of a perfectly still scene, always has tiny
+    # frame-to-frame sensor noise, so identical encoded bytes repeating
+    # many times in a row is a reliable sign the feed has actually frozen.
+    # Exiting here lets the parent's existing "no new frame" watchdog
+    # restart this process the same way it does for a hang.
+    last_jpeg = None
+    identical_count = 0
+    FROZEN_FRAME_LIMIT = 15
+
     while not stop_evt.is_set():
         ret, frame = cap.read()
         if not ret:
@@ -306,13 +320,25 @@ def camera_worker_process(frame_queue, stop_evt):
         ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ok:
             continue
+        jpeg_bytes = jpeg.tobytes()
+
+        if jpeg_bytes == last_jpeg:
+            identical_count += 1
+            if identical_count >= FROZEN_FRAME_LIMIT:
+                print("Camera feed appears frozen (identical frames repeating), "
+                      "exiting worker so it gets restarted...")
+                break
+        else:
+            identical_count = 0
+        last_jpeg = jpeg_bytes
+
         try:
             while not frame_queue.empty():
                 frame_queue.get_nowait()
         except Exception:
             pass
         try:
-            frame_queue.put_nowait(jpeg.tobytes())
+            frame_queue.put_nowait(jpeg_bytes)
         except Exception:
             pass
     cap.release()
