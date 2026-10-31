@@ -21,8 +21,10 @@ One-time Pi setup:
 
 import base64
 import hmac
+import multiprocessing as mp
 import os
 import platform
+import queue
 import subprocess
 import threading
 import time
@@ -281,92 +283,111 @@ def camera_setup(cap):
               f"saved to {CONFIG_FILE}")
 
 
-def usb_capture_loop(cap):
+def camera_worker_process(frame_queue, stop_evt):
+    """Runs in a separate OS process, not a thread. When the camera drops
+    (USB power event, driver reset, loose cable), cap.read() on DSHOW
+    frequently just blocks forever instead of failing fast — and if that
+    blocking native call doesn't release Python's GIL (a known rough edge
+    here), NO other thread in that same process can run either, including
+    a watchdog thread meant to notice and recover. A separate process has
+    no such entanglement: the parent can kill it outright regardless of
+    what it's stuck on, which a same-process thread fundamentally cannot
+    guarantee. CAMERA_FOCUS/CAMERA_EXPOSURE are picked up fresh from the
+    config file by reopen_usb_camera() since this module reloads on spawn.
+    """
+    cap = reopen_usb_camera()
+    if cap is None:
+        return
+    while not stop_evt.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.2)
+            continue
+        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if not ok:
+            continue
+        try:
+            while not frame_queue.empty():
+                frame_queue.get_nowait()
+        except Exception:
+            pass
+        try:
+            frame_queue.put_nowait(jpeg.tobytes())
+        except Exception:
+            pass
+    cap.release()
+
+
+def usb_capture_loop():
     global latest_frame, latest_raw_frame, stream_delay
 
-    # Match the network stream's pace to what the camera actually delivers.
-    # The driver-reported FPS (CAP_PROP_FPS) is unreliable on many UVC
-    # cameras/backends (DSHOW in particular often reports 0), so measure
-    # the real achieved rate directly instead of trusting it.
-    warmup_frames = 20
-    start = time.perf_counter()
-    measured = 0
-    for _ in range(warmup_frames):
-        ok, _ = cap.read()
-        if ok:
-            measured += 1
-    elapsed = time.perf_counter() - start
-    if measured > 0 and elapsed > 0:
-        measured_fps = measured / elapsed
+    ctx = mp.get_context("spawn")
+    frame_queue = ctx.Queue(maxsize=1)
+    stop_evt = ctx.Event()
+
+    def start_worker():
+        p = ctx.Process(target=camera_worker_process, args=(frame_queue, stop_evt), daemon=True)
+        p.start()
+        return p
+
+    proc = start_worker()
+
+    # Measure the achieved rate from real frame arrivals instead of
+    # trusting the unreliable driver-reported FPS (DSHOW often reports 0).
+    warmup_deadline = time.perf_counter() + 3.0
+    received = 0
+    t0 = time.perf_counter()
+    while time.perf_counter() < warmup_deadline and not stop_event.is_set():
+        try:
+            frame_queue.get(timeout=0.5)
+            received += 1
+        except queue.Empty:
+            continue
+    elapsed = time.perf_counter() - t0
+    if received > 1 and elapsed > 0:
+        measured_fps = received / elapsed
         stream_delay = 1 / measured_fps
         print(f"Measured camera rate: {measured_fps:.1f} FPS, streaming at that rate.")
     else:
         print(f"Could not measure camera rate, falling back to {STREAM_FPS} FPS.")
 
-    # When the camera actually drops (USB power event, driver reset, loose
-    # cable), cap.read() on DSHOW frequently doesn't fail fast — it just
-    # blocks forever, so a simple failure counter never gets the chance to
-    # run. A watchdog thread tracks how long the current read has been
-    # running and, if it's stuck past WATCHDOG_TIMEOUT, calls cap.release()
-    # from outside — that's the standard way to force a blocked
-    # VideoCapture.read() to return, since there's no native read timeout.
-    state = {"cap": cap, "read_started_at": None}
+    # If no frame has arrived from the worker in this long, assume it's
+    # stuck (hung read, crashed, camera dropped) and kill + restart the
+    # whole process — a hard OS-level kill works no matter what it's
+    # wedged on, unlike anything relying on cooperative shutdown.
     WATCHDOG_TIMEOUT = 5.0
-
-    def watchdog():
-        while not stop_event.is_set():
-            time.sleep(1)
-            started = state["read_started_at"]
-            if started is not None and time.monotonic() - started > WATCHDOG_TIMEOUT:
-                print("Camera read appears stuck, forcing release to unblock it...")
-                try:
-                    state["cap"].release()
-                except Exception:
-                    pass
-                state["read_started_at"] = None
-
-    threading.Thread(target=watchdog, daemon=True).start()
-
-    consecutive_failures = 0
-    # A few transient failures aren't worth reopening over, but if the
-    # camera has actually dropped, retrying forever on the same dead
-    # handle never recovers — the feed just goes black until someone
-    # restarts the whole program. Past this many failures in a row,
-    # do a full reopen instead, carrying over the saved focus/exposure.
-    REOPEN_AFTER = 10
+    last_frame_time = time.monotonic()
 
     while not stop_event.is_set():
-        state["read_started_at"] = time.monotonic()
-        ret, frame = state["cap"].read()
-        state["read_started_at"] = None
-        if not ret:
-            consecutive_failures += 1
-            print(f"Frame grab failed ({consecutive_failures}), retrying...")
-            if consecutive_failures >= REOPEN_AFTER:
-                print("Camera appears to have dropped, reopening device...")
-                try:
-                    state["cap"].release()
-                except Exception:
-                    pass
-                new_cap = None
-                while new_cap is None and not stop_event.is_set():
-                    new_cap = reopen_usb_camera()
-                    if new_cap is None:
-                        time.sleep(2)
-                if new_cap is not None:
-                    state["cap"] = new_cap
-                    print("Camera reopened successfully.")
-                    consecutive_failures = 0
-            else:
-                time.sleep(0.5)
-            continue
-        consecutive_failures = 0
-        ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        if ok:
+        try:
+            jpeg_bytes = frame_queue.get(timeout=1.0)
+            last_frame_time = time.monotonic()
+            raw = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
             with frame_lock:
-                latest_frame = jpeg.tobytes()
-                latest_raw_frame = frame
-    state["cap"].release()
+                latest_frame = jpeg_bytes
+                latest_raw_frame = raw
+        except queue.Empty:
+            pass
+
+        if time.monotonic() - last_frame_time > WATCHDOG_TIMEOUT:
+            print("Camera worker process appears stuck, killing and restarting it...")
+            proc.terminate()
+            proc.join(timeout=3)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=3)
+            try:
+                while not frame_queue.empty():
+                    frame_queue.get_nowait()
+            except Exception:
+                pass
+            proc = start_worker()
+            last_frame_time = time.monotonic()
+            print("Camera worker process restarted.")
+
+    stop_evt.set()
+    proc.terminate()
+    proc.join(timeout=3)
 
 
 def check_auth(handler):
@@ -617,7 +638,11 @@ def main():
             cap.release()
             cv2.destroyAllWindows()
             return
-        threading.Thread(target=usb_capture_loop, args=(cap,), daemon=True).start()
+        # Calibration is done with this handle — the operational capture
+        # loop opens its own fresh handle in a separate process, so this
+        # one is released rather than left holding the device.
+        cap.release()
+        threading.Thread(target=usb_capture_loop, daemon=True).start()
         server = ThreadingHTTPServer(("0.0.0.0", PORT), UsbStreamHandler)
 
     print(f"Serving at http://0.0.0.0:{PORT}/video  (snapshot: /shot.jpg)")
@@ -630,4 +655,5 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()
