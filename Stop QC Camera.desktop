@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Stop QC Camera
+Comment=Stop the camera streaming program
+Exec=/home/abuzer-rpi/stop_camera.sh
+Icon=process-stop
+Terminal=false

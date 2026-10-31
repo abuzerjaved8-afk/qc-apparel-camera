@@ -1,0 +1,5 @@
+qc_camera_config.txt
+*.pid
+*.log
+__pycache__/
+*.pyc

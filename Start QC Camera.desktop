@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Start QC Camera
+Comment=Start the camera streaming program
+Exec=/home/abuzer-rpi/start_camera.sh
+Icon=camera-video
+Terminal=false
