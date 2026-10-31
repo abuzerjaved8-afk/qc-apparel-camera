@@ -225,7 +225,7 @@ def camera_setup(cap):
         display = frame.copy()
         cv2.putText(display, f"Focus: {focus_val:.0f}   Exposure: {exposure_val:.0f}",
                     (40, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 255, 0), 3)
-        cv2.putText(display, "+/- focus    [ ] exposure (helps with light flicker)",
+        cv2.putText(display, "+/- focus    4/5 exposure (helps with light flicker)",
                     (40, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         hint = "p: open camera driver settings (look for Anti-Flicker)    " if IS_WINDOWS else ""
         cv2.putText(display, f"{hint}ENTER confirm and start streaming",
@@ -240,10 +240,10 @@ def camera_setup(cap):
         elif key in (ord("-"), ord("_")):
             focus_val = max(0, focus_val - focus_step)
             cap.set(cv2.CAP_PROP_FOCUS, focus_val)
-        elif key == ord("]"):
+        elif key == ord("5"):
             exposure_val += exposure_step
             cap.set(cv2.CAP_PROP_EXPOSURE, exposure_val)
-        elif key == ord("["):
+        elif key == ord("4"):
             exposure_val -= exposure_step
             cap.set(cv2.CAP_PROP_EXPOSURE, exposure_val)
         elif key == ord("p") and IS_WINDOWS:
