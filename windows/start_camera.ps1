@@ -1,3 +1,9 @@
+# Refresh PATH from the registry in case Python was installed after this
+# desktop session started (a freshly launched cmd/explorer still has the
+# PATH that was current at login/boot time, not the installer's update).
+$env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+            [System.Environment]::GetEnvironmentVariable('Path', 'User')
+
 $pidFile = "$env:USERPROFILE\qc_camera.pid"
 if (Test-Path $pidFile) {
     $oldPid = Get-Content $pidFile
