@@ -187,6 +187,24 @@ def open_usb_camera():
     return cap
 
 
+def reopen_usb_camera():
+    """Used after the camera drops mid-stream (see usb_capture_loop). Same
+    as open_usb_camera() but also reapplies the already-calibrated focus
+    and exposure, so a reconnect doesn't fall back to a blurry/flickering
+    default — no interactive calibration screen here, it just restores
+    the last confirmed-good values."""
+    cap = open_usb_camera()
+    if cap is None:
+        return None
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    if CAMERA_FOCUS is not None:
+        cap.set(cv2.CAP_PROP_FOCUS, CAMERA_FOCUS)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+    if CAMERA_EXPOSURE is not None:
+        cap.set(cv2.CAP_PROP_EXPOSURE, CAMERA_EXPOSURE)
+    return cap
+
+
 def camera_setup(cap):
     """One-time manual focus/exposure calibration shown before streaming
     starts. Displays the exact same full-resolution frames the live feed
@@ -204,6 +222,7 @@ def camera_setup(cap):
     webcams (including Logitech's) has an explicit Anti-Flicker/Power Line
     Frequency setting that's a more direct fix than tuning exposure blind.
     """
+    global CAMERA_FOCUS, CAMERA_EXPOSURE
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
     focus_val = float(CAMERA_FOCUS) if CAMERA_FOCUS is not None else cap.get(cv2.CAP_PROP_FOCUS)
     cap.set(cv2.CAP_PROP_FOCUS, focus_val)
@@ -254,8 +273,10 @@ def camera_setup(cap):
 
     cv2.destroyWindow(window)
     if not stop_event.is_set():
-        save_config_value("CAMERA_FOCUS", int(focus_val))
-        save_config_value("CAMERA_EXPOSURE", int(exposure_val))
+        CAMERA_FOCUS = int(focus_val)
+        CAMERA_EXPOSURE = int(exposure_val)
+        save_config_value("CAMERA_FOCUS", CAMERA_FOCUS)
+        save_config_value("CAMERA_EXPOSURE", CAMERA_EXPOSURE)
         print(f"Focus set to {focus_val:.0f}, exposure set to {exposure_val:.0f}, "
               f"saved to {CONFIG_FILE}")
 
@@ -282,12 +303,35 @@ def usb_capture_loop(cap):
     else:
         print(f"Could not measure camera rate, falling back to {STREAM_FPS} FPS.")
 
+    consecutive_failures = 0
+    # A few transient failures aren't worth reopening over, but if the
+    # camera has actually dropped (USB power management, driver reset,
+    # loose cable) retrying forever on the same dead handle never
+    # recovers — the feed just goes black until someone restarts the
+    # whole program. Past this many failures in a row (~5s), do a full
+    # release + reopen instead, carrying over the saved focus/exposure.
+    REOPEN_AFTER = 10
+
     while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
-            print("Frame grab failed, retrying...")
-            time.sleep(0.5)
+            consecutive_failures += 1
+            print(f"Frame grab failed ({consecutive_failures}), retrying...")
+            if consecutive_failures >= REOPEN_AFTER:
+                print("Camera appears to have dropped, reopening device...")
+                cap.release()
+                cap = None
+                while cap is None and not stop_event.is_set():
+                    cap = reopen_usb_camera()
+                    if cap is None:
+                        time.sleep(2)
+                if cap is not None:
+                    print("Camera reopened successfully.")
+                    consecutive_failures = 0
+            else:
+                time.sleep(0.5)
             continue
+        consecutive_failures = 0
         ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if ok:
             with frame_lock:
